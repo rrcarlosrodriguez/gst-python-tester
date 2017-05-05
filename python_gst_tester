@@ -1,0 +1,215 @@
+#!/usr/bin/env python3.4
+
+import shlex
+import subprocess
+import os, os.path
+import time
+import signal
+import re
+import sys, getopt
+import datetime
+
+summary_pattern = "test-summary-%s.log"
+timeout = 120
+pattern = "gst-launch-1.0 %s"
+
+class Result(object):
+    def __init__(self, cmd, stdout, stderr, summary, code):
+        self.cmd = cmd
+        self.summary = summary
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def is_failure(self):
+        return True
+
+    def __str__(self):
+        return "=======\n%s\n=======\n\nStdOut:\n-------\n%s\nStdErr:\n-------\n%s\n"%(self.summary, self.stdout, self.stderr)
+
+class Pass(Result):
+    def __init__(self, cmd=None, stdout=None, stderr=None):
+        super(Pass, self).__init__(cmd, stdout, None, "PASS", 0)
+
+    def is_failure(self):
+        return False
+
+class Timeout(Result):
+    def __init__(self, cmd=None, stdout=None, stderr=None, code=None):
+        super(Timeout, self).__init__(cmd, stdout, stderr, "TIMEOUT", code)
+
+class Killed(Result):
+    def __init__(self, cmd=None, stdout=None, stderr=None, code=None):
+        super(Killed, self).__init__(cmd, stdout, stderr, "KILLED", code)
+
+class Error(Result):
+    def __init__(self, cmd=None, stdout=None, stderr=None, code=None):
+        super(Error, self).__init__(cmd, stdout, stderr, "ERROR", code)
+
+
+class Process(subprocess.Popen):
+    class KilledProcess(Exception):
+        def __init__(self):
+            super(Process.KilledProcess, self).__init__("Process killed by signal")
+
+    def __init__(self, cmd, env):
+        self._killed = False
+        super(Process, self).__init__(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True, env=env)
+
+    def finish(self, timeout=None):
+        try:
+            (self.stdout_data, self.stderr_data) = self.communicate(input, timeout)
+        except subprocess.TimeoutExpired as e:
+            self.interrupt()
+            (self.stdout_data, self.stderr_data) = self.communicate()
+            raise e
+
+        if self._killed:
+            raise self.KilledProcess()
+        elif 0 != self.returncode:
+            raise subprocess.CalledProcessError(self.returncode, self.args)
+
+
+    def interrupt(self):
+        self._killed = True
+        self.send_signal(signal.SIGINT)
+
+class Pipeline(object):
+    def __init__(self, desc, pipe_id, file_summary):
+        super(Pipeline, self).__init__()
+        self.desc = desc
+        self.pipe_id = pipe_id
+        self.file_summary = file_summary
+        self.pattern = pattern
+        self.timeout = timeout
+        self._proc = None
+        self._cmd = shlex.split(self.pattern%(self.desc))
+        self._killed = False
+
+    def run(self, debug=0):
+        env = os.environ.copy()
+        env['GST_DEBUG'] = str(debug)
+        self._proc = Process(self._cmd, env=env)
+
+    def kill(self):
+        if self._proc:
+            self._proc.kill()
+
+    def wait(self):
+        ret = None
+        result = ''
+        try:
+            self._proc.finish(self.timeout)
+            result = "PASS"
+            ret = Pass()
+        except subprocess.CalledProcessError as e:
+            result = "ERROR"
+            ret = Error()
+            ret.code = self._proc.returncode
+        except subprocess.TimeoutExpired as e:
+            result = "TIMEOUT"
+            ret = Timeout()
+            ret.code = self._proc.returncode
+        except Process.KilledProcess as e:
+            result = "KILLED"
+            ret = Killed()
+            ret.code = self._proc.returncode
+
+        ret.cmd = self._cmd
+        ret.stdout = self._proc.stdout_data
+        ret.stderr = self._proc.stderr_data
+
+        # Write result in general summary
+        time_now = datetime.datetime.now()
+        self.file_summary.write ('%s : %s : %s\n'%(self.pipe_id,result,time_now.strftime("%Y-%m-%d-%H:%M")))
+
+        # Write result in specific pipeline log
+        separate = re.split('.log', self.file_summary.name)
+        pipe_summary_file = '%s/%s/%s'%(os.getcwd(),separate[0],self.pipe_id)
+
+        os.makedirs(os.path.dirname(pipe_summary_file), exist_ok=True)
+        with open(pipe_summary_file, "w") as f:
+            f.write('%s'%(ret))
+
+        return ret
+
+class WebRTCPipeline(Pipeline):
+    def __init__(self, session, desc):
+        sessiondesc = desc%(session)
+        super(WebRTCPipeline, self).__init__(sessiondesc)
+
+def runtest (pipelines, file_summary):
+
+    testid = pipelines[0]
+    pipeline1 = pipelines[1]
+    pipeline2 = pipelines[2]
+    debuglevel = pipelines[3] #[3]
+    time_now = datetime.datetime.now()
+    first = Pipeline (pipeline1, '%s-first'%testid, file_summary)
+    second = Pipeline (pipeline2, '%s-second'%testid, file_summary)
+    i = 1
+    while True:
+        print ("**************************************")
+        print ("Running test with id: " ,testid, "\n")
+        print ("-> Endurance number: " ,i, "\n")
+        first.run(debuglevel)
+        second.run(debuglevel)
+        retfirst = first.wait()
+        retsecond = second.wait()
+
+        print ("First pipeline: " ,pipeline1, ":", retfirst.summary,  ":", time_now.strftime("%Y-%m-%d-%H:%M"))
+        print ("Second pipeline: " ,pipeline2, ":", retsecond.summary, ":", time_now.strftime("%Y-%m-%d-%H:%M"))
+        print ("**************************************")
+
+        if retsecond.summary != "PASS" or retfirst.summary != "PASS":
+            break
+        i = i+1
+    
+def main(argv):
+
+    try:
+        opts, args = getopt.getopt(argv, "hf:",["file="])
+    except getopt.GetoptError:
+        print ('Usage: python_gst_tester -f <pipelinesfile>')
+        sys.exit(2)
+    for opt, arg in opts:
+        if opt == '-h':
+            print ('Usage: python_gst_tester -f <pipelinesfile>')
+            sys.exit()
+        elif opt in ("-f", "--file"):
+            pipelinesfile = arg
+
+    print ("***********************************")
+    print ("Checking Pipelines file:")
+
+    # Check if pipelines file exist and is readable
+    if os.path.isfile(pipelinesfile) and os.access(pipelinesfile, os.R_OK): 
+        print ("   File exists and is readable")
+        print ("***********************************")
+    else:
+        print ("   Error: Either file is missing or is not readable")
+        print ("***********************************")
+        sys.exit()
+
+    # Create summary file
+    time_now = datetime.datetime.now()
+    file_name = summary_pattern%(time_now.strftime("%Y-%m-%d-%H:%M"))
+    file_summary = open (file_name, "w")
+
+    file_summary.write("*********************************************************\n")
+    file_summary.write("Summary for all tests run for file: %s\n"%(pipelinesfile))
+    file_summary.write("Time: %s\n"%(time_now.strftime("%Y-%m-%d-%H:%M")))
+    file_summary.write("*********************************************************\n\n")
+
+    # Open file with pipelines
+    file_pipelines = open(pipelinesfile, "r")
+
+    for line in file_pipelines:
+        pipelines = re.split(':::', line)
+        if len(pipelines) == 4: #4
+            runtest(pipelines, file_summary)
+
+    file_summary.close ()
+    file_pipelines.close()
+
+if __name__ == '__main__':
+   main(sys.argv[1:])

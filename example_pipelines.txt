@@ -1,0 +1,3 @@
+#VIDEO
+
+test1:::videotestsrc is-live=true num-buffers=300 ! videoconvert ! fakesink :::audiotestsrc is-live=true num-buffers=100 ! fakesink:::2,*src*:1,*STATES*:4
